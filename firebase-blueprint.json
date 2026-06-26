@@ -1,0 +1,107 @@
+{
+  "entities": {
+    "User": {
+      "title": "User Profile",
+      "description": "User account information, onboarding answers, and streak metadata.",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string" },
+        "name": { "type": "string" },
+        "email": { "type": "string" },
+        "onboardingCompleted": { "type": "boolean" },
+        "onboardingAnswers": { "type": "object" },
+        "monthlyBills": { "type": "array" },
+        "currentStreak": { "type": "integer" },
+        "lastActiveDate": { "type": "string" },
+        "dailyGoalCount": { "type": "integer" }
+      },
+      "required": ["uid", "email"]
+    },
+    "Task": {
+      "title": "Task",
+      "description": "A productivity task, meeting, event, bill, commitment, or assignment.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "userId": { "type": "string" },
+        "title": { "type": "string" },
+        "description": { "type": "string" },
+        "type": { "type": "string" },
+        "category": { "type": "string" },
+        "priority": { "type": "string" },
+        "dueDate": { "type": "string" },
+        "completed": { "type": "boolean" },
+        "completedDate": { "type": "string" },
+        "createdAt": { "type": "string" },
+        "timeSpentMs": { "type": "integer" },
+        "pomodoroInterventions": { "type": "array" },
+        "isRecurring": { "type": "boolean" },
+        "streakAdjusted": { "type": "boolean" },
+        "explanation": { "type": "string" }
+      },
+      "required": ["id", "userId", "title", "type", "category", "priority", "completed"]
+    },
+    "MoodLog": {
+      "title": "Mood Log",
+      "description": "Logs tracking daily user energy and mood levels.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "userId": { "type": "string" },
+        "energyLevel": { "type": "string" },
+        "energyPercent": { "type": "integer" },
+        "note": { "type": "string" },
+        "date": { "type": "string" },
+        "createdAt": { "type": "string" }
+      },
+      "required": ["id", "userId", "energyLevel", "energyPercent", "date"]
+    },
+    "ChatMessage": {
+      "title": "Chat Message",
+      "description": "A single chat message exchange between user and Rumi companion.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "userId": { "type": "string" },
+        "role": { "type": "string" },
+        "content": { "type": "string" },
+        "createdAt": { "type": "string" }
+      },
+      "required": ["id", "userId", "role", "content", "createdAt"]
+    },
+    "SavedChat": {
+      "title": "Saved Chat",
+      "description": "A saved historical conversation with Rumi companion containing multiple messages.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "title": { "type": "string" },
+        "createdAt": { "type": "string" },
+        "messages": { "type": "array" }
+      },
+      "required": ["title", "createdAt", "messages"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": "User",
+      "description": "Stores user profiles."
+    },
+    "/users/{userId}/tasks/{taskId}": {
+      "schema": "Task",
+      "description": "Stores user tasks, events, bills, and assignments."
+    },
+    "/users/{userId}/moodLogs/{logId}": {
+      "schema": "MoodLog",
+      "description": "Stores user daily energy logs."
+    },
+    "/users/{userId}/chats/{chatId}": {
+      "schema": "ChatMessage",
+      "description": "Stores chat messages with Rumi."
+    },
+    "/users/{userId}/saved_chats/{savedChatId}": {
+      "schema": "SavedChat",
+      "description": "Stores user's saved Rumi conversations."
+    }
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "name": "Rumi",
+  "description": "An AI-powered empathetic productivity companion that proactively assists users in planning, prioritising, and completing tasks without self-guilt.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
