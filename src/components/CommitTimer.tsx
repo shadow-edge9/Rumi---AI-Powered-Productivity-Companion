@@ -1,8 +1,112 @@
 import React, { useState, useEffect, useRef } from "react";
 import { Task } from "../types";
-import { Play, Pause, RotateCcw, AlertTriangle, HelpCircle, Check, Loader2, Sparkles } from "lucide-react";
+import { Play, Pause, RotateCcw, AlertTriangle, HelpCircle, Check, Loader2, Sparkles, Flame, Coffee, VolumeX, Volume2 } from "lucide-react";
 import { doc, updateDoc } from "firebase/firestore";
 import { db } from "../firebase";
+
+// Synthesized Fireplace Soundscape (Brown Noise + Sparkles) using Web Audio API
+class HearthSoundscape {
+  private ctx: AudioContext | null = null;
+  private noiseSource: AudioBufferSourceNode | null = null;
+  private filter: BiquadFilterNode | null = null;
+  private crackleInterval: any = null;
+  private gainNode: GainNode | null = null;
+
+  start() {
+    try {
+      const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
+      this.ctx = new AudioContextClass();
+      
+      this.gainNode = this.ctx.createGain();
+      this.gainNode.gain.setValueAtTime(0.35, this.ctx.currentTime);
+      
+      const bufferSize = this.ctx.sampleRate * 2;
+      const buffer = this.ctx.createBuffer(1, bufferSize, this.ctx.sampleRate);
+      const data = buffer.getChannelData(0);
+      let lastOut = 0.0;
+      for (let i = 0; i < bufferSize; i++) {
+        const white = Math.random() * 2 - 1;
+        data[i] = (lastOut + (0.02 * white)) / 1.02;
+        lastOut = data[i];
+        data[i] *= 4.5;
+      }
+
+      this.noiseSource = this.ctx.createBufferSource();
+      this.noiseSource.buffer = buffer;
+      this.noiseSource.loop = true;
+
+      this.filter = this.ctx.createBiquadFilter();
+      this.filter.type = "lowpass";
+      this.filter.frequency.setValueAtTime(320, this.ctx.currentTime);
+
+      this.noiseSource.connect(this.filter);
+      this.filter.connect(this.gainNode);
+      this.gainNode.connect(this.ctx.destination);
+      
+      this.noiseSource.start(0);
+
+      this.crackleInterval = setInterval(() => {
+        if (!this.ctx || this.ctx.state === "suspended") return;
+        if (Math.random() > 0.4) {
+          this.playCrackle();
+        }
+      }, 180);
+    } catch (err) {
+      console.error("Web Audio API failed to initialize hearth soundscape:", err);
+    }
+  }
+
+  private playCrackle() {
+    if (!this.ctx) return;
+    try {
+      const duration = 0.008 + Math.random() * 0.02;
+      const sampleRate = this.ctx.sampleRate;
+      const crackleBuffer = this.ctx.createBuffer(1, sampleRate * duration, sampleRate);
+      const data = crackleBuffer.getChannelData(0);
+      
+      for (let i = 0; i < data.length; i++) {
+        data[i] = (Math.random() * 2 - 1) * Math.exp(-i / (data.length * 0.25));
+      }
+
+      const source = this.ctx.createBufferSource();
+      source.buffer = crackleBuffer;
+
+      const bandpass = this.ctx.createBiquadFilter();
+      bandpass.type = "bandpass";
+      bandpass.frequency.setValueAtTime(1100 + Math.random() * 1400, this.ctx.currentTime);
+      bandpass.Q.setValueAtTime(4, this.ctx.currentTime);
+
+      const gain = this.ctx.createGain();
+      gain.gain.setValueAtTime(0.06 + Math.random() * 0.1, this.ctx.currentTime);
+
+      source.connect(bandpass);
+      bandpass.connect(gain);
+      gain.connect(this.ctx.destination);
+
+      source.start();
+    } catch (e) {}
+  }
+
+  stop() {
+    if (this.crackleInterval) {
+      clearInterval(this.crackleInterval);
+      this.crackleInterval = null;
+    }
+    try {
+      if (this.noiseSource) {
+        this.noiseSource.stop();
+        this.noiseSource.disconnect();
+        this.noiseSource = null;
+      }
+    } catch (e) {}
+    try {
+      if (this.ctx) {
+        this.ctx.close();
+        this.ctx = null;
+      }
+    } catch (e) {}
+  }
+}
 
 interface CommitTimerProps {
   tasks: Task[];
@@ -19,13 +123,44 @@ export default function CommitTimer({ tasks, activeTaskId, onActiveTaskChange, o
   const [loadingBreakdown, setLoadingBreakdown] = useState(false);
   const [suggestedSubtasks, setSuggestedSubtasks] = useState<string[]>([]);
   const [addedSubtasks, setAddedSubtasks] = useState<string[]>([]);
+  
+  // Custom states for break mode & roaring hearth soundscape
+  const [isBreakMode, setIsBreakMode] = useState(false);
+  const [breakDuration, setBreakDuration] = useState(5 * 60); // 5 mins default
+  const [isHearthPlaying, setIsHearthPlaying] = useState(false);
 
   const activeTask = tasks.find(t => t.id === activeTaskId) || null;
   const timerRef = useRef<NodeJS.Timeout | null>(null);
+  const hearthRef = useRef<HearthSoundscape | null>(null);
+
+  // Stop soundscape on unmount
+  useEffect(() => {
+    return () => {
+      if (hearthRef.current) {
+        hearthRef.current.stop();
+      }
+    };
+  }, []);
+
+  const toggleHearth = () => {
+    if (isHearthPlaying) {
+      if (hearthRef.current) {
+        hearthRef.current.stop();
+        hearthRef.current = null;
+      }
+      setIsHearthPlaying(false);
+    } else {
+      const soundscape = new HearthSoundscape();
+      soundscape.start();
+      hearthRef.current = soundscape;
+      setIsHearthPlaying(true);
+    }
+  };
 
   // Reset timer when active task changes
   useEffect(() => {
     setIsRunning(false);
+    setIsBreakMode(false);
     setTimeLeft(25 * 60);
     setTotalSecondsSpent(0);
     setInterventionTriggered(false);
@@ -39,23 +174,33 @@ export default function CommitTimer({ tasks, activeTaskId, onActiveTaskChange, o
       timerRef.current = setInterval(() => {
         setTimeLeft(prev => {
           if (prev <= 1) {
-            setIsRunning(false);
-            if (timerRef.current) clearInterval(timerRef.current);
-            return 0;
+            // Focus or Break session depleted!
+            if (!isBreakMode) {
+              // Transition from Focus to Break automatically & initialize immediate start
+              setIsBreakMode(true);
+              return breakDuration;
+            } else {
+              // Transition from Break to Focus
+              setIsBreakMode(false);
+              setIsRunning(false);
+              return 25 * 60;
+            }
           }
           return prev - 1;
         });
 
-        setTotalSecondsSpent(prev => {
-          const updated = prev + 1;
-          // Trigger intervention if spent exceeds 1.5 hours (90 minutes = 5400 seconds)
-          if (updated >= 5400 && !interventionTriggered) {
-            setIsRunning(false);
-            setInterventionTriggered(true);
-            if (timerRef.current) clearInterval(timerRef.current);
-          }
-          return updated;
-        });
+        if (!isBreakMode) {
+          setTotalSecondsSpent(prev => {
+            const updated = prev + 1;
+            // Trigger intervention if spent exceeds 1.5 hours (90 minutes = 5400 seconds)
+            if (updated >= 5400 && !interventionTriggered) {
+              setIsRunning(false);
+              setInterventionTriggered(true);
+              if (timerRef.current) clearInterval(timerRef.current);
+            }
+            return updated;
+          });
+        }
       }, 1000);
     } else {
       if (timerRef.current) clearInterval(timerRef.current);
@@ -64,7 +209,7 @@ export default function CommitTimer({ tasks, activeTaskId, onActiveTaskChange, o
     return () => {
       if (timerRef.current) clearInterval(timerRef.current);
     };
-  }, [isRunning, interventionTriggered]);
+  }, [isRunning, interventionTriggered, isBreakMode, breakDuration]);
 
   const handleToggle = () => {
     if (!activeTaskId) return;
@@ -73,6 +218,7 @@ export default function CommitTimer({ tasks, activeTaskId, onActiveTaskChange, o
 
   const handleReset = () => {
     setIsRunning(false);
+    setIsBreakMode(false);
     setTimeLeft(25 * 60);
     setTotalSecondsSpent(0);
     setInterventionTriggered(false);
@@ -222,17 +368,86 @@ export default function CommitTimer({ tasks, activeTaskId, onActiveTaskChange, o
           
           {activeTask ? (
             <div className="w-full max-w-md flex flex-col items-center text-center space-y-6">
-              <div>
-                <span className="text-[10px] font-bold text-[#00606E] bg-[#E9E7DF] border border-[#E5E2D9]/40 px-3 py-1 rounded-full uppercase tracking-wider">
-                  Active Focus
-                </span>
-                <h4 className="text-xl font-serif font-semibold text-[#1A2B32] mt-2 line-clamp-1">
-                  {activeTask.title}
-                </h4>
-                <p className="text-xs text-[#8A958E] mt-1 font-serif italic">
-                  Time spent on this task: {Math.round((activeTask.timeSpentMs || 0) / 1000 / 60)} minutes
-                </p>
-              </div>
+              
+              <style dangerouslySetInnerHTML={{__html: `
+                @keyframes steam {
+                  0% { transform: translateY(0) scaleX(1); opacity: 0; }
+                  15% { opacity: 0.6; }
+                  50% { transform: translateY(-10px) scaleX(1.25); opacity: 0.35; }
+                  100% { transform: translateY(-20px) scaleX(0.8); opacity: 0; }
+                }
+                .animate-steam-1 { animation: steam 2.4s infinite ease-in-out; }
+                .animate-steam-2 { animation: steam 2.4s infinite ease-in-out; animation-delay: 0.8s; }
+                .animate-steam-3 { animation: steam 2.4s infinite ease-in-out; animation-delay: 1.6s; }
+              `}} />
+
+              {isBreakMode ? (
+                /* Dedicated Break Section */
+                <div className="w-full flex flex-col items-center text-center space-y-5" id="break-section">
+                  <div className="space-y-1">
+                    <span className="text-[10px] font-bold text-[#D97706] bg-amber-50 border border-amber-200 px-3 py-1 rounded-full uppercase tracking-wider flex items-center gap-1.5 justify-center mx-auto w-fit">
+                      <Coffee className="h-3 w-3 animate-pulse" /> Coffee Break Mode
+                    </span>
+                    <h4 className="text-xl font-serif font-semibold text-[#1A2B32] mt-2">
+                      Time for a gentle pause
+                    </h4>
+                    <p className="text-xs text-[#8A958E] font-serif italic">
+                      Sip, stretch, and let your mind drift.
+                    </p>
+                  </div>
+
+                  {/* Stylized Coffee Cup Icon with Steaming Animation */}
+                  <div className="relative flex flex-col items-center justify-center pt-8 pb-4">
+                    <svg className="w-16 h-16 text-[#00606E] overflow-visible" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
+                      <path className="animate-steam-1" d="M6 4 Q8 1 6 -2 Q8 -5 6 -8" stroke="#8A958E" strokeWidth="1.2" strokeLinecap="round" fill="none" />
+                      <path className="animate-steam-2" d="M12 4 Q14 1 12 -2 Q14 -5 12 -8" stroke="#8A958E" strokeWidth="1.2" strokeLinecap="round" fill="none" />
+                      <path className="animate-steam-3" d="M18 4 Q20 1 18 -2 Q20 -5 18 -8" stroke="#8A958E" strokeWidth="1.2" strokeLinecap="round" fill="none" />
+                      <path d="M4 11C4 15 7 18 11 18H13C17 18 20 15 20 11V7H4V11Z" fill="#F8F7F2" stroke="currentColor" />
+                      <path d="M20 9C21.5 9 23 10 23 11.5C23 13 21.5 14 20 14" stroke="currentColor" strokeLinecap="round" />
+                      <path d="M2 21H22" stroke="currentColor" strokeLinecap="round" />
+                    </svg>
+                  </div>
+
+                  {/* Preset Break Duration Selector */}
+                  <div className="bg-white border border-[#E5E2D9] rounded-2xl p-4 w-full max-w-sm space-y-3 shadow-xs">
+                    <span className="block text-[10px] font-bold text-[#1A2B32] uppercase tracking-wider">
+                      Select Break Duration
+                    </span>
+                    <div className="grid grid-cols-3 gap-2">
+                      {[5, 10, 30].map(mins => (
+                        <button
+                          key={mins}
+                          type="button"
+                          onClick={() => {
+                            setBreakDuration(mins * 60);
+                            setTimeLeft(mins * 60);
+                          }}
+                          className={`py-2 rounded-xl text-xs font-sans font-bold border transition-all cursor-pointer ${
+                            breakDuration === mins * 60
+                              ? "bg-[#00606E] border-[#00606E] text-white shadow-xs"
+                              : "bg-[#F8F7F2] border-[#E5E2D9] text-[#4A5568] hover:border-[#00606E]/40"
+                          }`}
+                        >
+                          {mins} Min
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              ) : (
+                /* Focus Mode Section */
+                <div>
+                  <span className="text-[10px] font-bold text-[#00606E] bg-[#E9E7DF] border border-[#E5E2D9]/40 px-3 py-1 rounded-full uppercase tracking-wider">
+                    Active Focus
+                  </span>
+                  <h4 className="text-xl font-serif font-semibold text-[#1A2B32] mt-2 line-clamp-1">
+                    {activeTask.title}
+                  </h4>
+                  <p className="text-xs text-[#8A958E] mt-1 font-serif italic">
+                    Time spent on this task: {formatTime(25 * 60 - timeLeft)}
+                  </p>
+                </div>
+              )}
 
               {/* Huge Timer display */}
               <div className="text-6xl md:text-7xl font-serif text-[#1A2B32] font-light tracking-tight bg-white border border-[#E5E2D9] px-8 py-5 rounded-3xl shadow-sm">
@@ -243,7 +458,7 @@ export default function CommitTimer({ tasks, activeTaskId, onActiveTaskChange, o
               <div className="flex items-center gap-3">
                 <button
                   onClick={handleToggle}
-                  className={`h-14 w-14 rounded-full flex items-center justify-center text-white transition-all shadow-md ${
+                  className={`h-14 w-14 rounded-full flex items-center justify-center text-white transition-all shadow-md cursor-pointer ${
                     isRunning 
                       ? "bg-[#C55A5A] hover:bg-[#A94A4A] shadow-[#C55A5A]/10" 
                       : "bg-[#00606E] hover:bg-[#004550] shadow-[#00606E]/10"
@@ -253,17 +468,42 @@ export default function CommitTimer({ tasks, activeTaskId, onActiveTaskChange, o
                 </button>
                 <button
                   onClick={handleReset}
-                  className="h-10 w-10 rounded-full bg-white hover:bg-[#E9E7DF]/50 border border-[#E5E2D9] flex items-center justify-center text-[#4A5568] transition-all"
+                  className="h-10 w-10 rounded-full bg-white hover:bg-[#E9E7DF]/50 border border-[#E5E2D9] flex items-center justify-center text-[#4A5568] transition-all cursor-pointer"
                   title="Reset Timer"
                 >
                   <RotateCcw className="h-4 w-4" />
                 </button>
               </div>
 
+              {/* Toggleable Ambient Soundspace Section */}
+              <div className="w-full max-w-sm pt-2">
+                <button
+                  type="button"
+                  onClick={toggleHearth}
+                  className={`w-full py-2.5 px-4 rounded-xl text-xs font-sans font-bold border transition-all flex items-center justify-center gap-2 cursor-pointer ${
+                    isHearthPlaying
+                      ? "bg-amber-500/10 border-amber-500 text-amber-700 font-bold"
+                      : "bg-white border-[#E5E2D9] text-[#8A958E] hover:border-amber-500/40 hover:text-[#4A5568]"
+                  }`}
+                >
+                  {isHearthPlaying ? (
+                    <>
+                      <Flame className="h-4 w-4 text-amber-600 animate-pulse" />
+                      <span>Hearth Ambient: ON (Brown Noise Loop)</span>
+                    </>
+                  ) : (
+                    <>
+                      <Flame className="h-4 w-4 text-gray-400" />
+                      <span>Roaring Hearth Ambient Soundscape</span>
+                    </>
+                  )}
+                </button>
+              </div>
+
               <div className="w-full">
                 <button
                   onClick={handleCompleteTask}
-                  className="w-full py-3 border-2 border-[#00606E] text-[#00606E] hover:bg-[#00606E] hover:text-white rounded-xl text-xs font-bold uppercase tracking-widest transition-all"
+                  className="w-full py-3 border-2 border-[#00606E] text-[#00606E] hover:bg-[#00606E] hover:text-white rounded-xl text-xs font-bold uppercase tracking-widest transition-all cursor-pointer"
                 >
                   Mark Task as Complete & Stop Timer
                 </button>
@@ -271,7 +511,9 @@ export default function CommitTimer({ tasks, activeTaskId, onActiveTaskChange, o
 
               {/* Progress feedback */}
               <p className="text-[11px] text-[#8A958E] font-serif italic">
-                {isRunning ? "Focusing beautifully. Rest is as important as flow." : "Timer paused. Deep breaths."}
+                {isBreakMode
+                  ? "Enjoying break state... Sip mindfully."
+                  : isRunning ? "Focusing beautifully. Rest is as important as flow." : "Timer paused. Deep breaths."}
               </p>
             </div>
           ) : (

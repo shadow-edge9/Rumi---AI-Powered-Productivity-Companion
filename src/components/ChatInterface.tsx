@@ -33,6 +33,23 @@ interface SavedChat {
   messages: Omit<ChatMessage, "id">[];
 }
 
+const formatScheduleDate = (dateStr: string) => {
+  if (!dateStr) return "";
+  try {
+    const parts = dateStr.split('-');
+    if (parts.length === 3) {
+      const year = parseInt(parts[0], 10);
+      const month = parseInt(parts[1], 10) - 1;
+      const day = parseInt(parts[2], 10);
+      const date = new Date(year, month, day);
+      return date.toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' });
+    }
+  } catch (e) {
+    console.error("Error formatting date", e);
+  }
+  return dateStr;
+};
+
 export default function ChatInterface({ 
   user, 
   userProfile,
@@ -97,6 +114,100 @@ export default function ChatInterface({
     { label: "Give me a breathing space", text: "I need a quick mindful breathing exercise to calm down." },
     { label: "✨ Start a New Chat", text: "", action: "clear" }
   ];
+
+  // Helper to map friendly task IDs (e.g., task_1) to real Tasks
+  const getTaskFromFriendlyId = (friendlyId: string): Task | null => {
+    if (!tasks || !Array.isArray(tasks)) return null;
+    const match = friendlyId.match(/task_(\d+)/i);
+    if (!match) return null;
+    const index = parseInt(match[1]) - 1;
+    if (index >= 0 && index < tasks.length) {
+      return tasks[index];
+    }
+    return null;
+  };
+
+  // Agentic task execution handler
+  const handleExecuteAction = async (action: "DELETE" | "RESCHEDULE", taskId: string, newDate?: string) => {
+    if (!user) return;
+    try {
+      if (action === "DELETE") {
+        await deleteDoc(doc(db, "users", user.uid, "tasks", taskId));
+        showToast("Task dismissed successfully", "success");
+      } else if (action === "RESCHEDULE" && newDate) {
+        await updateDoc(doc(db, "users", user.uid, "tasks", taskId), {
+          dueDate: newDate
+        });
+        showToast(`Task rescheduled to ${newDate}`, "success");
+      }
+      if (onTaskUpdated) {
+        onTaskUpdated();
+      }
+    } catch (err) {
+      console.error("Error executing agentic command:", err);
+      showToast("An update error occurred. Please try again.", "error");
+    }
+  };
+
+  // Automated background command checker (now intercepts with an agentic confirmation gateway!)
+  const checkForAutomaticCommands = async (replyText: string) => {
+    if (!user) return;
+    
+    // Check for [COMMAND: DELETE: task_x]
+    const delMatch = replyText.match(/\[COMMAND:\s*DELETE:\s*(task_\d+)\]/i);
+    if (delMatch) {
+      const friendlyId = delMatch[1];
+      const realTask = getTaskFromFriendlyId(friendlyId);
+      if (realTask) {
+        setConfirmModal({
+          isOpen: true,
+          title: "Rumi Proposes: Dismiss Task",
+          message: `Rumi intends to dismiss the task "${realTask.title}". Would you like to proceed with this modification?`,
+          onConfirm: async () => {
+            try {
+              await deleteDoc(doc(db, "users", user.uid, "tasks", realTask.id));
+              showToast(`Task "${realTask.title}" dismissed successfully`, "success");
+              if (onTaskUpdated) onTaskUpdated();
+            } catch (e) {
+              console.error("Auto delete failed", e);
+              showToast("An update error occurred. Please try again.", "error");
+            } finally {
+              setConfirmModal(null);
+            }
+          }
+        });
+      }
+    }
+
+    // Check for [COMMAND: RESCHEDULE: task_x: YYYY-MM-DD]
+    const reschedMatch = replyText.match(/\[COMMAND:\s*RESCHEDULE:\s*(task_\d+):\s*([\d\-]+)\]/i);
+    if (reschedMatch) {
+      const friendlyId = reschedMatch[1];
+      const newDate = reschedMatch[2];
+      const realTask = getTaskFromFriendlyId(friendlyId);
+      if (realTask && newDate) {
+        setConfirmModal({
+          isOpen: true,
+          title: "Rumi Proposes: Reschedule Task",
+          message: `Rumi intends to reschedule the task "${realTask.title}" from ${realTask.dueDate || "No Date"} to ${newDate}. Would you like to proceed?`,
+          onConfirm: async () => {
+            try {
+              await updateDoc(doc(db, "users", user.uid, "tasks", realTask.id), {
+                dueDate: newDate
+              });
+              showToast(`Task "${realTask.title}" rescheduled to ${newDate}`, "success");
+              if (onTaskUpdated) onTaskUpdated();
+            } catch (e) {
+              console.error("Auto reschedule failed", e);
+              showToast("An update error occurred. Please try again.", "error");
+            } finally {
+              setConfirmModal(null);
+            }
+          }
+        });
+      }
+    }
+  };
 
   // Show customized toaster notifications
   const showToast = (message: string, type: "success" | "error" | "info" = "success") => {
@@ -597,6 +708,9 @@ Please read the contents of the mail/task/event in question, and give a clear, g
       const data = await response.json();
       const reply = data.response || "I am here with you. Let's take it one step at a time.";
 
+      // Check for automated agentic task commands
+      await checkForAutomaticCommands(reply);
+
       // 4. Save model reply to Firestore
       const assistantMessage: Omit<ChatMessage, "id"> = {
         userId: user.uid,
@@ -1024,9 +1138,10 @@ Please read the contents of the mail/task/event in question, and give a clear, g
                     const isUser = m.role === "user";
                     const isSpeakingThis = speakingId === m.id && isPlayingVoice;
 
-                    // Parse potential Rumi subtask breakdown JSON tags
+                    // Parse potential Rumi subtask breakdown JSON tags and agentic proposals
                     let displayText = m.content;
                     let breakdownData: { parentTaskId: string; subtasks: (string | { title: string; dueDate?: string })[] } | null = null;
+                    let proposalData: { type: "DELETE" | "RESCHEDULE"; task: Task; newDate?: string } | null = null;
 
                     const tagIndex = m.content.indexOf("[BREAKDOWN_JSON:");
                     if (tagIndex !== -1 && !isUser) {
@@ -1043,6 +1158,36 @@ Please read the contents of the mail/task/event in question, and give a clear, g
                       } else {
                         displayText = m.content.substring(0, tagIndex);
                       }
+                    }
+
+                    // Parse agentic proposals
+                    if (!isUser) {
+                      // Pattern: [PROPOSAL: DELETE: task_x]
+                      const propDelMatch = displayText.match(/\[PROPOSAL:\s*DELETE:\s*(task_\d+)\]/i);
+                      if (propDelMatch) {
+                        const friendlyId = propDelMatch[1];
+                        const t = getTaskFromFriendlyId(friendlyId);
+                        if (t) {
+                          proposalData = { type: "DELETE", task: t };
+                        }
+                        displayText = displayText.replace(propDelMatch[0], "");
+                      }
+
+                      // Pattern: [PROPOSAL: RESCHEDULE: task_x: YYYY-MM-DD]
+                      const propReschedMatch = displayText.match(/\[PROPOSAL:\s*RESCHEDULE:\s*(task_\d+):\s*([\d\-]+)\]/i);
+                      if (propReschedMatch) {
+                        const friendlyId = propReschedMatch[1];
+                        const newDate = propReschedMatch[2];
+                        const t = getTaskFromFriendlyId(friendlyId);
+                        if (t) {
+                          proposalData = { type: "RESCHEDULE", task: t, newDate };
+                        }
+                        displayText = displayText.replace(propReschedMatch[0], "");
+                      }
+
+                      // Also strip any COMMAND tags that might be in the string
+                      displayText = displayText.replace(/\[COMMAND:\s*DELETE:\s*task_\d+\]/gi, "");
+                      displayText = displayText.replace(/\[COMMAND:\s*RESCHEDULE:\s*task_\d+:\s*[\d\-]+\]/gi, "");
                     }
 
                     return (
@@ -1100,8 +1245,8 @@ Please read the contents of the mail/task/event in question, and give a clear, g
                                         <span className="text-[11px] text-[#4A5568] leading-tight font-medium">{title}</span>
                                       </div>
                                       {dueDate && (
-                                        <span className="text-[9px] font-mono font-semibold bg-amber-50 text-amber-700 border border-amber-100 rounded px-1.5 py-0.5 shrink-0">
-                                          {dueDate}
+                                        <span className="text-[9px] font-sans font-semibold bg-[#EBF7F6] text-[#00606E] border border-[#D1ECEB] rounded px-1.5 py-0.5 shrink-0">
+                                          {formatScheduleDate(dueDate)}
                                         </span>
                                       )}
                                     </div>
@@ -1130,6 +1275,67 @@ Please read the contents of the mail/task/event in question, and give a clear, g
                                     <span>ACCEPT PLAN</span>
                                   </button>
                                 )}
+                              </div>
+                            </div>
+                          )}
+
+                          {proposalData && proposalData.type === "DELETE" && proposalData.task && (
+                            <div className="mt-4 p-4 bg-red-50/50 border border-red-100 rounded-2xl text-left font-sans space-y-3 not-italic">
+                              <div className="flex items-center gap-2 text-red-700">
+                                <Trash2 className="h-4 w-4" />
+                                <span className="text-[10px] font-bold uppercase tracking-wider">Rumi Proposes: Dismiss Task</span>
+                              </div>
+                              <div className="bg-white p-3 rounded-xl border border-red-100/50 space-y-1 shadow-2xs">
+                                <div className="text-xs font-bold text-gray-800">{proposalData.task.title}</div>
+                                <div className="text-[10px] text-gray-500 font-medium">Due: {proposalData.task.dueDate || "No date"} • Priority: {proposalData.task.priority}</div>
+                              </div>
+                              <div className="text-xs font-medium text-gray-700">Shall I proceed?</div>
+                              <div className="flex items-center gap-2 pt-1">
+                                <button
+                                  onClick={() => handleExecuteAction("DELETE", proposalData!.task.id)}
+                                  className="px-3 py-1.5 bg-[#00606E] hover:bg-[#004550] text-white text-[10px] font-bold rounded-xl flex items-center gap-1 transition-all cursor-pointer"
+                                >
+                                  <Check className="h-3 w-3" />
+                                  <span>Yes, proceed</span>
+                                </button>
+                                <button
+                                  onClick={() => showToast("Dismiss canceled", "info")}
+                                  className="px-3 py-1.5 border border-gray-200 hover:bg-gray-50 text-[10px] font-semibold text-gray-500 rounded-xl transition cursor-pointer bg-white"
+                                >
+                                  Cancel
+                                </button>
+                              </div>
+                            </div>
+                          )}
+
+                          {proposalData && proposalData.type === "RESCHEDULE" && proposalData.task && (
+                            <div className="mt-4 p-4 bg-amber-50/50 border border-amber-100 rounded-2xl text-left font-sans space-y-3 not-italic">
+                              <div className="flex items-center gap-2 text-amber-700">
+                                <Calendar className="h-4 w-4" />
+                                <span className="text-[10px] font-bold uppercase tracking-wider">Rumi Proposes: Reschedule Task</span>
+                              </div>
+                              <div className="bg-white p-3 rounded-xl border border-amber-100/50 space-y-1 shadow-2xs">
+                                <div className="text-xs font-bold text-gray-800">{proposalData.task.title}</div>
+                                <div className="text-[10px] text-gray-600 font-medium">Current Date: {proposalData.task.dueDate || "No date"}</div>
+                                <div className="text-[10px] text-amber-700 font-bold flex items-center gap-1">
+                                  <ArrowLeft className="h-3 w-3 rotate-180" /> Proposed New Date: {proposalData.newDate}
+                                </div>
+                              </div>
+                              <div className="text-xs font-medium text-gray-700">Shall I proceed?</div>
+                              <div className="flex items-center gap-2 pt-1">
+                                <button
+                                  onClick={() => handleExecuteAction("RESCHEDULE", proposalData!.task.id, proposalData!.newDate)}
+                                  className="px-3 py-1.5 bg-[#00606E] hover:bg-[#004550] text-white text-[10px] font-bold rounded-xl flex items-center gap-1 transition-all cursor-pointer"
+                                >
+                                  <Check className="h-3 w-3" />
+                                  <span>Yes, proceed</span>
+                                </button>
+                                <button
+                                  onClick={() => showToast("Rescheduling canceled", "info")}
+                                  className="px-3 py-1.5 border border-gray-200 hover:bg-gray-50 text-[10px] font-semibold text-gray-500 rounded-xl transition cursor-pointer bg-white"
+                                >
+                                  Cancel
+                                </button>
                               </div>
                             </div>
                           )}
@@ -1221,19 +1427,176 @@ Please read the contents of the mail/task/event in question, and give a clear, g
               <div className="space-y-4">
                 {selectedSavedChat.messages.map((m, index) => {
                   const isUser = m.role === "user";
+
+                  // Parse potential Rumi subtask breakdown JSON tags and agentic proposals
+                  let displayText = m.content;
+                  let breakdownData: { parentTaskId: string; subtasks: (string | { title: string; dueDate?: string })[] } | null = null;
+                  let proposalData: { type: "DELETE" | "RESCHEDULE"; task: Task; newDate?: string } | null = null;
+
+                  const tagIndex = m.content.indexOf("[BREAKDOWN_JSON:");
+                  if (tagIndex !== -1 && !isUser) {
+                    const endIndex = m.content.lastIndexOf("]");
+                    if (endIndex > tagIndex) {
+                      try {
+                        const jsonStr = m.content.substring(tagIndex + 16, endIndex);
+                        breakdownData = JSON.parse(jsonStr);
+                      } catch (e) {
+                        console.error("Failed to parse breakdown JSON tag in saved chat:", e);
+                      }
+                      // Always strip raw JSON to avoid unprofessional logs/views
+                      displayText = m.content.substring(0, tagIndex) + m.content.substring(endIndex + 1);
+                    } else {
+                      displayText = m.content.substring(0, tagIndex);
+                    }
+                  }
+
+                  // Parse agentic proposals
+                  if (!isUser) {
+                    // Pattern: [PROPOSAL: DELETE: task_x]
+                    const propDelMatch = displayText.match(/\[PROPOSAL:\s*DELETE:\s*(task_\d+)\]/i);
+                    if (propDelMatch) {
+                      const friendlyId = propDelMatch[1];
+                      const t = getTaskFromFriendlyId(friendlyId);
+                      if (t) {
+                        proposalData = { type: "DELETE", task: t };
+                      }
+                      displayText = displayText.replace(propDelMatch[0], "");
+                    }
+
+                    // Pattern: [PROPOSAL: RESCHEDULE: task_x: YYYY-MM-DD]
+                    const propReschedMatch = displayText.match(/\[PROPOSAL:\s*RESCHEDULE:\s*(task_\d+):\s*([\d\-]+)\]/i);
+                    if (propReschedMatch) {
+                      const friendlyId = propReschedMatch[1];
+                      const newDate = propReschedMatch[2];
+                      const t = getTaskFromFriendlyId(friendlyId);
+                      if (t) {
+                        proposalData = { type: "RESCHEDULE", task: t, newDate };
+                      }
+                      displayText = displayText.replace(propReschedMatch[0], "");
+                    }
+
+                    // Also strip any COMMAND tags that might be in the string
+                    displayText = displayText.replace(/\[COMMAND:\s*DELETE:\s*task_\d+\]/gi, "");
+                    displayText = displayText.replace(/\[COMMAND:\s*RESCHEDULE:\s*task_\d+:\s*[\d\-]+\]/gi, "");
+                  }
+
                   return (
                     <div
                       key={index}
                       className={`flex ${isUser ? "justify-end" : "justify-start"}`}
                     >
                       <div
-                        className={`max-w-[85%] rounded-2xl p-4 text-xs leading-relaxed whitespace-pre-wrap ${
+                        className={`max-w-[85%] rounded-2xl p-4 text-xs leading-relaxed ${
                           isUser
-                            ? "bg-[#5AA9A7] text-white rounded-br-none shadow-xs font-sans"
-                            : "bg-[#FDFCF8] text-[#2D3748] rounded-bl-none border border-[#D1D5DB] font-serif italic"
+                            ? "bg-[#5AA9A7] text-white rounded-br-none shadow-xs font-sans whitespace-pre-wrap"
+                            : "bg-[#FDFCF8] text-[#2D3748] rounded-bl-none border border-[#D1D5DB] font-sans"
                         }`}
                       >
-                        {m.content}
+                        {isUser ? (
+                          displayText
+                        ) : (
+                          <div className="markdown-body prose max-w-none text-xs text-[#2D3748] space-y-1 [&_ul]:list-disc [&_ul]:pl-4 [&_ol]:list-decimal [&_ol]:pl-4 [&_strong]:font-bold [&_p]:mb-1 last:[&_p]:mb-0">
+                            <Markdown>{displayText}</Markdown>
+                          </div>
+                        )}
+
+                        {breakdownData && (
+                          <div className="mt-4 p-4 bg-white border border-[#E5E2D9] rounded-2xl shadow-xs font-sans not-italic text-left space-y-3">
+                            <div className="flex items-center gap-2 border-b border-gray-100 pb-2">
+                              <CheckSquare className="h-4 w-4 text-[#00606E]" />
+                              <span className="text-xs font-bold text-[#1A2B32] uppercase tracking-wide">Rumi's Focused Breakdown</span>
+                            </div>
+                            <div className="space-y-2">
+                              {breakdownData.subtasks.map((sub, sIdx) => {
+                                const title = typeof sub === "string" ? sub : sub.title;
+                                const dueDate = typeof sub === "string" ? null : sub.dueDate;
+                                return (
+                                  <div key={sIdx} className="flex items-start justify-between gap-2.5 border-b border-gray-50/50 pb-1.5 last:border-0 last:pb-0">
+                                    <div className="flex items-start gap-2.5">
+                                      <div className="h-4 w-4 rounded-md border border-gray-300 bg-[#EAF0EB] flex items-center justify-center shrink-0 mt-0.5">
+                                        <Check className="h-3 w-3 text-[#00606E]" />
+                                      </div>
+                                      <span className="text-[11px] text-[#4A5568] leading-tight font-medium">{title}</span>
+                                    </div>
+                                    {dueDate && (
+                                      <span className="text-[9px] font-sans font-semibold bg-[#EBF7F6] text-[#00606E] border border-[#D1ECEB] rounded px-1.5 py-0.5 shrink-0">
+                                        {formatScheduleDate(dueDate)}
+                                      </span>
+                                    )}
+                                  </div>
+                                );
+                              })}
+                            </div>
+                            
+                            {/* State-Dependent UI Control: If a task has already been accepted/committed to database, the button MUST be completely stripped */}
+                            {!lockedTaskIds[breakdownData.parentTaskId] && (
+                              <div className="pt-2">
+                                <button
+                                  id={`btn-lock-targets-saved-${breakdownData.parentTaskId}`}
+                                  onClick={() => handleLockTargets(breakdownData!.parentTaskId, breakdownData!.subtasks)}
+                                  disabled={lockingTargets}
+                                  className="w-full bg-[#00606E] hover:bg-[#004550] text-white font-bold py-2.5 px-3 rounded-xl text-[10px] uppercase tracking-wider flex items-center justify-center gap-1.5 transition-all shadow-xs cursor-pointer active:scale-95 disabled:opacity-50"
+                                >
+                                  {lockingTargets ? (
+                                    <Loader2 className="h-3 w-3 animate-spin text-white" />
+                                  ) : (
+                                    <Calendar className="h-3.5 w-3.5 text-white" />
+                                  )}
+                                  <span>ACCEPT PLAN</span>
+                                </button>
+                              </div>
+                            )}
+                          </div>
+                        )}
+
+                        {proposalData && proposalData.type === "DELETE" && proposalData.task && (
+                          <div className="mt-4 p-4 bg-red-50/50 border border-red-100 rounded-2xl text-left font-sans space-y-3 not-italic">
+                            <div className="flex items-center gap-2 text-red-700">
+                              <Trash2 className="h-4 w-4" />
+                              <span className="text-[10px] font-bold uppercase tracking-wider">Rumi Proposes: Dismiss Task</span>
+                            </div>
+                            <div className="bg-white p-3 rounded-xl border border-red-100/50 space-y-1 shadow-2xs">
+                              <div className="text-xs font-bold text-gray-800">{proposalData.task.title}</div>
+                              <div className="text-[10px] text-gray-500 font-medium">Due: {formatScheduleDate(proposalData.task.dueDate || "") || "No date"} • Priority: {proposalData.task.priority}</div>
+                            </div>
+                            <div className="text-xs font-medium text-gray-700">Shall I proceed?</div>
+                            <div className="flex items-center gap-2 pt-1">
+                              <button
+                                onClick={() => handleExecuteAction("DELETE", proposalData!.task.id)}
+                                className="px-3 py-1.5 bg-[#00606E] hover:bg-[#004550] text-white text-[10px] font-bold rounded-xl flex items-center gap-1 transition-all cursor-pointer"
+                              >
+                                <Check className="h-3 w-3" />
+                                <span>Yes, proceed</span>
+                              </button>
+                            </div>
+                          </div>
+                        )}
+
+                        {proposalData && proposalData.type === "RESCHEDULE" && proposalData.task && (
+                          <div className="mt-4 p-4 bg-amber-50/50 border border-amber-100 rounded-2xl text-left font-sans space-y-3 not-italic">
+                            <div className="flex items-center gap-2 text-amber-700">
+                              <Calendar className="h-4 w-4" />
+                              <span className="text-[10px] font-bold uppercase tracking-wider">Rumi Proposes: Reschedule Task</span>
+                            </div>
+                            <div className="bg-white p-3 rounded-xl border border-amber-100/50 space-y-1 shadow-2xs">
+                              <div className="text-xs font-bold text-gray-800">{proposalData.task.title}</div>
+                              <div className="text-[10px] text-gray-600 font-medium">Current Date: {formatScheduleDate(proposalData.task.dueDate || "") || "No date"}</div>
+                              <div className="text-[10px] text-amber-700 font-bold flex items-center gap-1">
+                                <ArrowLeft className="h-3 w-3 rotate-180" /> Proposed New Date: {formatScheduleDate(proposalData.newDate || "")}
+                              </div>
+                            </div>
+                            <div className="text-xs font-medium text-gray-700">Shall I proceed?</div>
+                            <div className="flex items-center gap-2 pt-1">
+                              <button
+                                onClick={() => handleExecuteAction("RESCHEDULE", proposalData!.task.id, proposalData!.newDate)}
+                                className="px-3 py-1.5 bg-[#00606E] hover:bg-[#004550] text-white text-[10px] font-bold rounded-xl flex items-center gap-1 transition-all cursor-pointer"
+                              >
+                                <Check className="h-3 w-3" />
+                                <span>Yes, proceed</span>
+                              </button>
+                            </div>
+                          </div>
+                        )}
                       </div>
                     </div>
                   );

@@ -1,11 +1,18 @@
 import React, { useState, useEffect } from "react";
 import { UserProfile } from "../types";
-import { doc, updateDoc } from "firebase/firestore";
-import { db } from "../firebase";
+import { doc, updateDoc, collection, getDocs, deleteDoc } from "firebase/firestore";
+import { db, auth } from "../firebase";
+import { 
+  EmailAuthProvider, 
+  reauthenticateWithCredential, 
+  updatePassword, 
+  deleteUser, 
+  signOut 
+} from "firebase/auth";
 import { 
   Save, Sparkles, Moon, Sun, ListTodo, Plus, Trash2, KeyRound, 
   Check, ShieldAlert, Laptop, Mail, Calendar, CheckSquare, 
-  Settings, ArrowRight, HelpCircle
+  Settings, ArrowRight, HelpCircle, ArrowLeft, Loader2, Lock, ShieldCheck
 } from "lucide-react";
 
 interface SettingsViewProps {
@@ -17,6 +24,241 @@ export default function SettingsView({ userProfile, onProfileUpdated }: Settings
   const [saving, setSaving] = useState(false);
   const [saveSuccess, setSaveSuccess] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  // Security View States
+  const [subView, setSubView] = useState<"main" | "password" | "delete">("main");
+  const [currentPassword, setCurrentPassword] = useState("");
+  const [newPassword, setNewPassword] = useState("");
+  const [confirmNewPassword, setConfirmNewPassword] = useState("");
+  const [failedAttempts, setFailedAttempts] = useState(0);
+  const [securityStatus, setSecurityStatus] = useState<{ 
+    type: "idle" | "loading" | "success" | "error" | "attack"; 
+    message: string;
+  }>({ type: "idle", message: "" });
+  const [deletingProgress, setDeletingProgress] = useState<string>("");
+
+  // PASSWORD STRENGTH ENFORCEMENT RULES
+  const validatePasswordStrength = (pwd: string) => {
+    if (pwd.length < 10) {
+      return { valid: false, reason: "Password must be at least 10 characters long." };
+    }
+    if (!/[A-Z]/.test(pwd)) {
+      return { valid: false, reason: "Password must contain at least one uppercase letter." };
+    }
+    if (!/[0-9]/.test(pwd)) {
+      return { valid: false, reason: "Password must contain at least one numerical digit." };
+    }
+    if (!/[!@#$%^&*(),.?":{}|<>]/.test(pwd)) {
+      return { valid: false, reason: "Password must contain at least one special character (e.g., !, @, #, $, %)." };
+    }
+    return { valid: true };
+  };
+
+  // ATTACK MITIGATION & LOCKOUT FLOW
+  const handleAttackDetection = async (reason: string) => {
+    setSecurityStatus({ 
+      type: "attack", 
+      message: `SECURITY ALERT: ${reason} Suspected account takeover attempt detected. Halting execution, clearing active session memory, and initiating session termination.` 
+    });
+    
+    // Clear passwords
+    setCurrentPassword("");
+    setNewPassword("");
+    setConfirmNewPassword("");
+
+    // Halt and force authentication reset (sign out of firebase)
+    setTimeout(async () => {
+      try {
+        await signOut(auth);
+        window.location.reload();
+      } catch (e) {
+        console.error("Force logout error:", e);
+      }
+    }, 4500);
+  };
+
+  // PASSWORD UPDATE PROTOCOL
+  const handlePasswordUpdate = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const currentUser = auth.currentUser;
+    if (!currentUser || !currentUser.email) {
+      setSecurityStatus({ type: "error", message: "No authenticated user session found." });
+      return;
+    }
+
+    // FORCE RE-AUTHENTICATION GATE
+    if (!currentPassword) {
+      setSecurityStatus({ 
+        type: "error", 
+        message: "To ensure the security of your account, " + (userProfile?.name || "User") + ", please enter your current password before providing a new one." 
+      });
+      return;
+    }
+
+    if (newPassword !== confirmNewPassword) {
+      setSecurityStatus({ type: "error", message: "Mismatched passwords! The new password and confirmation do not match." });
+      // Mismatches count as suspicious after repeated attempts
+      if (failedAttempts >= 2) {
+        handleAttackDetection("Multiple mismatched password confirmation attempts.");
+      } else {
+        setFailedAttempts(prev => prev + 1);
+      }
+      return;
+    }
+
+    // Password strength verification
+    const strengthResult = validatePasswordStrength(newPassword);
+    if (!strengthResult.valid) {
+      setSecurityStatus({ type: "error", message: strengthResult.reason || "Password does not meet strength rules." });
+      return;
+    }
+
+    setSecurityStatus({ type: "loading", message: "Verifying current credentials..." });
+
+    try {
+      // Re-authenticate user securely (never logged or transmitted)
+      const credential = EmailAuthProvider.credential(currentUser.email, currentPassword);
+      await reauthenticateWithCredential(currentUser, credential);
+      
+      // Update password directly
+      setSecurityStatus({ type: "loading", message: "Updating account password..." });
+      await updatePassword(currentUser, newPassword);
+
+      setSecurityStatus({ type: "success", message: "Your password has been securely updated!" });
+      setFailedAttempts(0);
+      setCurrentPassword("");
+      setNewPassword("");
+      setConfirmNewPassword("");
+    } catch (err: any) {
+      console.error("Password update error:", err);
+      const nextFailCount = failedAttempts + 1;
+      setFailedAttempts(nextFailCount);
+
+      if (nextFailCount >= 3) {
+        await handleAttackDetection("Too many failed re-authentication attempts.");
+      } else {
+        setSecurityStatus({ 
+          type: "error", 
+          message: `Authentication failed: ${err.message || "Invalid current password."} (${3 - nextFailCount} attempts remaining before secure lockout)`
+        });
+      }
+    }
+  };
+
+  // FAILS-SECURE PURGE DELETION PROTOCOL
+  const handleAccountDeletion = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const currentUser = auth.currentUser;
+    if (!currentUser || !currentUser.email) {
+      setSecurityStatus({ type: "error", message: "No authenticated user session found." });
+      return;
+    }
+
+    if (!currentPassword) {
+      setSecurityStatus({ type: "error", message: "Current password is required to verify account ownership." });
+      return;
+    }
+
+    setSecurityStatus({ type: "loading", message: "Authenticating..." });
+    setDeletingProgress("Re-authenticating secure purge credentials...");
+
+    try {
+      // 1. Re-authenticate
+      const credential = EmailAuthProvider.credential(currentUser.email, currentPassword);
+      await reauthenticateWithCredential(currentUser, credential);
+      
+      const uid = currentUser.uid;
+
+      // 2. Cascade programmatic data sweep: First, call database backend to purge all task sub-collections
+      // Tasks
+      try {
+        setDeletingProgress("Purging saved schedules and tasks...");
+        const tasksSnap = await getDocs(collection(db, "users", uid, "tasks"));
+        for (const d of tasksSnap.docs) {
+          await deleteDoc(doc(db, "users", uid, "tasks", d.id));
+        }
+      } catch (e) {
+        console.warn("Failed to purge tasks:", e);
+      }
+
+      // Chats
+      try {
+        setDeletingProgress("Purging Rumi conversation logs...");
+        const chatsSnap = await getDocs(collection(db, "users", uid, "chats"));
+        for (const d of chatsSnap.docs) {
+          await deleteDoc(doc(db, "users", uid, "chats", d.id));
+        }
+      } catch (e) {
+        console.warn("Failed to purge chats:", e);
+      }
+
+      // Saved Chats
+      try {
+        setDeletingProgress("Purging archived chat histories...");
+        const savedChatsSnap = await getDocs(collection(db, "users", uid, "saved_chats"));
+        for (const d of savedChatsSnap.docs) {
+          await deleteDoc(doc(db, "users", uid, "saved_chats", d.id));
+        }
+      } catch (e) {
+        console.warn("Failed to purge saved_chats:", e);
+      }
+
+      // Notifications
+      try {
+        setDeletingProgress("Purging notification systems...");
+        const notificationsSnap = await getDocs(collection(db, "users", uid, "notifications"));
+        for (const d of notificationsSnap.docs) {
+          await deleteDoc(doc(db, "users", uid, "notifications", d.id));
+        }
+      } catch (e) {
+        console.warn("Failed to purge notifications:", e);
+      }
+
+      // Mood Logs
+      try {
+        setDeletingProgress("Purging mood and energy log history...");
+        const moodLogsSnap = await getDocs(collection(db, "users", uid, "moodLogs"));
+        for (const d of moodLogsSnap.docs) {
+          await deleteDoc(doc(db, "users", uid, "moodLogs", d.id));
+        }
+      } catch (e) {
+        console.warn("Failed to purge moodLogs:", e);
+      }
+
+      // User profile document itself
+      try {
+        setDeletingProgress("Erasing profile metadata...");
+        await deleteDoc(doc(db, "users", uid));
+      } catch (e) {
+        console.warn("Failed to delete user document:", e);
+      }
+
+      // 3. Second, call the identity provider to terminate the user account (Firebase Auth)
+      setDeletingProgress("Purging authentication record from Identity Provider...");
+      await deleteUser(currentUser);
+
+      setSecurityStatus({ type: "success", message: "Account successfully purged. All data has been permanently erased." });
+      setDeletingProgress("");
+      
+      setTimeout(() => {
+        window.location.reload();
+      }, 3000);
+    } catch (err: any) {
+      console.error("Purge failure:", err);
+      setDeletingProgress("");
+      const nextFailCount = failedAttempts + 1;
+      setFailedAttempts(nextFailCount);
+
+      if (nextFailCount >= 3) {
+        await handleAttackDetection("Too many failed re-authentication attempts during account purge.");
+      } else {
+        setSecurityStatus({ 
+          type: "error", 
+          message: `Authentication failed: ${err.message || "Invalid current password."} Purge canceled.`
+        });
+      }
+    }
+  };
 
   // 1. Shift to High Priority Days
   const [shiftDays, setShiftDays] = useState<number>(3);
@@ -218,6 +460,322 @@ export default function SettingsView({ userProfile, onProfileUpdated }: Settings
       setSaving(false);
     }
   };
+
+  if (subView === "password") {
+    const isLengthMet = newPassword.length >= 10;
+    const isUppercaseMet = /[A-Z]/.test(newPassword);
+    const isNumberMet = /[0-9]/.test(newPassword);
+    const isSpecialMet = /[!@#$%^&*(),.?":{}|<>]/.test(newPassword);
+
+    return (
+      <div id="settings-view-container" className="space-y-6 max-w-2xl mx-auto pb-16 selection:bg-[#00606E]/20 animate-fade-in">
+        {/* Navigation / Header */}
+        <div className="flex items-center justify-between pb-4 border-b border-[#E5E2D9]">
+          <button
+            type="button"
+            id="btn-back-to-settings-password"
+            onClick={() => {
+              setSubView("main");
+              setSecurityStatus({ type: "idle", message: "" });
+              setCurrentPassword("");
+              setNewPassword("");
+              setConfirmNewPassword("");
+            }}
+            className="flex items-center gap-2 text-xs font-bold uppercase tracking-wider text-[#00606E] hover:text-[#004550] transition cursor-pointer"
+          >
+            <ArrowLeft className="h-4 w-4" /> Back to Settings
+          </button>
+          <span className="text-[10px] font-mono font-bold uppercase text-[#8A958E] tracking-widest">Security Protocol</span>
+        </div>
+
+        {/* Form Container */}
+        <div className="bg-white border border-[#E5E2D9] rounded-3xl p-6 md:p-8 space-y-6 shadow-2xs">
+          <div className="flex items-center gap-2.5 pb-4 border-b border-[#E5E2D9]">
+            <KeyRound className="h-5.5 w-5.5 text-[#00606E]" />
+            <div>
+              <h3 className="text-lg font-serif font-semibold text-[#1A2B32]">Change Account Password</h3>
+              <p className="text-xs text-[#8A958E] font-serif italic">Update your login security credentials</p>
+            </div>
+          </div>
+
+          {/* Prompt Banner */}
+          <div className="bg-[#F8F7F2] border border-[#E5E2D9] rounded-2xl p-4.5 text-xs text-[#1A2B32] font-medium leading-relaxed">
+            To ensure the security of your account, <span className="font-bold">{userProfile?.name || "User"}</span>, please enter your current password before providing a new one.
+          </div>
+
+          {/* Status Messages */}
+          {securityStatus.type === "success" && (
+            <div className="bg-emerald-50 border border-emerald-200 text-emerald-800 rounded-2xl p-4 text-xs font-sans flex items-center gap-2.5 animate-fade-in">
+              <ShieldCheck className="h-5 w-5 text-emerald-600 shrink-0" />
+              <div>
+                <span className="font-bold">Password Updated Successfully!</span> Your account access is now secured with your new password.
+              </div>
+            </div>
+          )}
+
+          {securityStatus.type === "error" && (
+            <div className="bg-red-50 border border-red-200 text-red-800 rounded-2xl p-4 text-xs font-sans flex items-center gap-2.5 animate-fade-in">
+              <ShieldAlert className="h-5 w-5 text-red-600 shrink-0" />
+              <div>
+                <span className="font-bold">Request Blocked:</span> {securityStatus.message}
+              </div>
+            </div>
+          )}
+
+          {securityStatus.type === "attack" && (
+            <div className="bg-red-950 border border-red-800 text-red-100 rounded-2xl p-5 text-xs font-sans space-y-3 animate-fade-in">
+              <div className="flex items-center gap-2.5 text-red-400 font-bold">
+                <ShieldAlert className="h-5 w-5 shrink-0 animate-bounce" />
+                <span className="uppercase tracking-wider">CRITICAL SECURITY LOCKOUT</span>
+              </div>
+              <p className="leading-relaxed">
+                {securityStatus.message}
+              </p>
+            </div>
+          )}
+
+          {securityStatus.type !== "attack" && (
+            <form onSubmit={handlePasswordUpdate} className="space-y-5">
+              {/* Current Password */}
+              <div className="space-y-2">
+                <label className="block text-xs font-bold text-[#1A2B32] uppercase tracking-wider">
+                  Current Password
+                </label>
+                <input
+                  id="input-current-password"
+                  type="password"
+                  required
+                  value={currentPassword}
+                  onChange={(e) => setCurrentPassword(e.target.value)}
+                  placeholder="Enter your current account password"
+                  className="w-full bg-[#F8F7F2] border border-[#E5E2D9] focus:outline-none focus:border-[#00606E] rounded-xl px-3.5 py-2.5 text-xs font-sans"
+                />
+              </div>
+
+              {/* New Password */}
+              <div className="space-y-2">
+                <label className="block text-xs font-bold text-[#1A2B32] uppercase tracking-wider">
+                  New Password
+                </label>
+                <input
+                  id="input-new-password"
+                  type="password"
+                  required
+                  value={newPassword}
+                  onChange={(e) => setNewPassword(e.target.value)}
+                  placeholder="Enter new 10+ character password"
+                  className="w-full bg-[#F8F7F2] border border-[#E5E2D9] focus:outline-none focus:border-[#00606E] rounded-xl px-3.5 py-2.5 text-xs font-sans"
+                />
+              </div>
+
+              {/* Confirm New Password */}
+              <div className="space-y-2">
+                <label className="block text-xs font-bold text-[#1A2B32] uppercase tracking-wider">
+                  Confirm New Password
+                </label>
+                <input
+                  id="input-confirm-new-password"
+                  type="password"
+                  required
+                  value={confirmNewPassword}
+                  onChange={(e) => setConfirmNewPassword(e.target.value)}
+                  placeholder="Confirm your new password"
+                  className="w-full bg-[#F8F7F2] border border-[#E5E2D9] focus:outline-none focus:border-[#00606E] rounded-xl px-3.5 py-2.5 text-xs font-sans"
+                />
+              </div>
+
+              {/* Strength Checklist */}
+              <div className="bg-[#F8F7F2]/60 border border-[#E5E2D9] rounded-2xl p-4.5 space-y-3">
+                <span className="block text-[10px] font-bold text-[#1A2B32] uppercase tracking-wider">Password Strength Enforcement</span>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                  <div className="flex items-center gap-2 text-xs font-medium text-gray-700">
+                    <div className={`h-4 w-4 rounded-full flex items-center justify-center shrink-0 border ${isLengthMet ? "bg-emerald-500 border-emerald-500 text-white animate-pulse" : "border-gray-300 text-transparent"}`}>
+                      <Check className="h-2.5 w-2.5" />
+                    </div>
+                    <span className={isLengthMet ? "text-emerald-700 font-semibold font-sans" : "text-gray-500 font-sans"}>At least 10 characters</span>
+                  </div>
+
+                  <div className="flex items-center gap-2 text-xs font-medium text-gray-700">
+                    <div className={`h-4 w-4 rounded-full flex items-center justify-center shrink-0 border ${isUppercaseMet ? "bg-emerald-500 border-emerald-500 text-white animate-pulse" : "border-gray-300 text-transparent"}`}>
+                      <Check className="h-2.5 w-2.5" />
+                    </div>
+                    <span className={isUppercaseMet ? "text-emerald-700 font-semibold font-sans" : "text-gray-500 font-sans"}>One uppercase letter</span>
+                  </div>
+
+                  <div className="flex items-center gap-2 text-xs font-medium text-gray-700">
+                    <div className={`h-4 w-4 rounded-full flex items-center justify-center shrink-0 border ${isNumberMet ? "bg-emerald-500 border-emerald-500 text-white animate-pulse" : "border-gray-300 text-transparent"}`}>
+                      <Check className="h-2.5 w-2.5" />
+                    </div>
+                    <span className={isNumberMet ? "text-emerald-700 font-semibold font-sans" : "text-gray-500 font-sans"}>One numerical digit</span>
+                  </div>
+
+                  <div className="flex items-center gap-2 text-xs font-medium text-gray-700">
+                    <div className={`h-4 w-4 rounded-full flex items-center justify-center shrink-0 border ${isSpecialMet ? "bg-emerald-500 border-emerald-500 text-white animate-pulse" : "border-gray-300 text-transparent"}`}>
+                      <Check className="h-2.5 w-2.5" />
+                    </div>
+                    <span className={isSpecialMet ? "text-emerald-700 font-semibold font-sans" : "text-gray-500 font-sans"}>One special char (!,@,#,$,%)</span>
+                  </div>
+                </div>
+              </div>
+
+              {/* Submit Button */}
+              <div className="pt-2">
+                <button
+                  type="submit"
+                  id="btn-update-password"
+                  disabled={securityStatus.type === "loading"}
+                  className="w-full bg-[#00606E] hover:bg-[#004550] text-white disabled:opacity-50 font-bold text-xs uppercase tracking-wider py-3.5 rounded-xl transition flex items-center justify-center gap-2 shadow-xs cursor-pointer active:scale-98"
+                >
+                  {securityStatus.type === "loading" ? (
+                    <>
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                      Updating Security Credentials...
+                    </>
+                  ) : (
+                    <>
+                      <Lock className="h-4 w-4" />
+                      Update Account Password
+                    </>
+                  )}
+                </button>
+              </div>
+            </form>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  if (subView === "delete") {
+    return (
+      <div id="settings-view-container" className="space-y-6 max-w-2xl mx-auto pb-16 selection:bg-[#00606E]/20 animate-fade-in">
+        {/* Navigation / Header */}
+        <div className="flex items-center justify-between pb-4 border-b border-[#E5E2D9]">
+          <button
+            type="button"
+            id="btn-back-to-settings-delete"
+            onClick={() => {
+              setSubView("main");
+              setSecurityStatus({ type: "idle", message: "" });
+              setCurrentPassword("");
+              setDeletingProgress("");
+            }}
+            disabled={securityStatus.type === "loading"}
+            className="flex items-center gap-2 text-xs font-bold uppercase tracking-wider text-[#00606E] hover:text-[#004550] disabled:opacity-40 transition cursor-pointer"
+          >
+            <ArrowLeft className="h-4 w-4" /> Back to Settings
+          </button>
+          <span className="text-[10px] font-mono font-bold uppercase text-red-600 tracking-widest">Fails-Secure Purge</span>
+        </div>
+
+        {/* Main Card */}
+        <div className="bg-white border border-[#E5E2D9] rounded-3xl p-6 md:p-8 space-y-6 shadow-2xs">
+          <div className="flex items-center gap-2.5 pb-4 border-b border-[#E5E2D9]">
+            <Trash2 className="h-5.5 w-5.5 text-red-600" />
+            <div>
+              <h3 className="text-lg font-serif font-semibold text-red-700">Delete Account & Erase Workspace</h3>
+              <p className="text-xs text-[#8A958E] font-serif italic">Permanently purge your active user identity</p>
+            </div>
+          </div>
+
+          {/* Warning Banner */}
+          <div className="bg-red-50 border border-red-200 rounded-2xl p-5 text-xs text-red-900 font-sans leading-relaxed space-y-3">
+            <div className="flex items-center gap-2 font-bold text-red-700">
+              <ShieldAlert className="h-5 w-5 shrink-0" />
+              <span className="uppercase tracking-wider">CRITICAL WARNING</span>
+            </div>
+            <p>
+              <strong>{userProfile?.name || "User"}</strong>, deleting your account will permanently erase all of your saved schedules, tasks, and data. This action cannot be undone. To proceed, please enter your current password to confirm your identity.
+            </p>
+          </div>
+
+          {/* Security status alerts */}
+          {securityStatus.type === "error" && (
+            <div className="bg-red-50 border border-red-200 text-red-800 rounded-2xl p-4 text-xs font-sans flex items-center gap-2.5 animate-fade-in">
+              <ShieldAlert className="h-5 w-5 text-red-600 shrink-0" />
+              <div>
+                <span className="font-bold">Purge Blocked:</span> {securityStatus.message}
+              </div>
+            </div>
+          )}
+
+          {securityStatus.type === "attack" && (
+            <div className="bg-red-950 border border-red-800 text-red-100 rounded-2xl p-5 text-xs font-sans space-y-3 animate-fade-in">
+              <div className="flex items-center gap-2.5 text-red-400 font-bold">
+                <ShieldAlert className="h-5 w-5 shrink-0 animate-bounce" />
+                <span className="uppercase tracking-wider">CRITICAL SECURITY LOCKOUT</span>
+              </div>
+              <p className="leading-relaxed">
+                {securityStatus.message}
+              </p>
+            </div>
+          )}
+
+          {/* Cascade Execution Notice */}
+          {deletingProgress && (
+            <div className="bg-amber-50 border border-amber-200 rounded-2xl p-4 text-xs font-sans text-amber-900 space-y-2 animate-fade-in">
+              <div className="flex items-center gap-2 font-bold text-amber-700">
+                <Loader2 className="h-4 w-4 animate-spin shrink-0" />
+                <span>CASCADE EXECUTION ACTIVE</span>
+              </div>
+              <p className="font-mono text-[10px] uppercase tracking-wider">{deletingProgress}</p>
+            </div>
+          )}
+
+          {securityStatus.type !== "attack" && securityStatus.type !== "success" && (
+            <form onSubmit={handleAccountDeletion} className="space-y-5">
+              <div className="space-y-2">
+                <label className="block text-xs font-bold text-[#1A2B32] uppercase tracking-wider">
+                  Current Password
+                </label>
+                <input
+                  id="input-delete-confirm-password"
+                  type="password"
+                  required
+                  value={currentPassword}
+                  onChange={(e) => setCurrentPassword(e.target.value)}
+                  disabled={securityStatus.type === "loading"}
+                  placeholder="Enter your current password to verify ownership"
+                  className="w-full bg-[#F8F7F2] border border-[#E5E2D9] focus:outline-none focus:border-[#00606E] rounded-xl px-3.5 py-2.5 text-xs font-sans"
+                />
+              </div>
+
+              <div className="pt-2">
+                <button
+                  type="submit"
+                  id="btn-confirm-delete-account"
+                  disabled={securityStatus.type === "loading"}
+                  className="w-full bg-red-600 hover:bg-red-700 text-white disabled:opacity-50 font-bold text-xs uppercase tracking-wider py-3.5 rounded-xl transition flex items-center justify-center gap-2 shadow-xs cursor-pointer active:scale-98"
+                >
+                  {securityStatus.type === "loading" ? (
+                    <>
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                      Executing Fails-Secure Purge...
+                    </>
+                  ) : (
+                    <>
+                      <Trash2 className="h-4 w-4" />
+                      Permanently Erase My Entire Account
+                    </>
+                  )}
+                </button>
+              </div>
+            </form>
+          )}
+
+          {securityStatus.type === "success" && (
+            <div className="bg-emerald-50 border border-emerald-200 text-emerald-800 rounded-2xl p-5 text-center text-xs font-sans space-y-3 animate-fade-in">
+              <ShieldCheck className="h-8 w-8 text-emerald-600 mx-auto" />
+              <div className="font-bold text-sm">FAILS-SECURE PURGE COMPLETE</div>
+              <p className="text-gray-600 leading-relaxed max-w-md mx-auto">
+                {securityStatus.message} Re-routing to entry screens...
+              </p>
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div id="settings-view-container" className="space-y-6 max-w-4xl mx-auto pb-16 selection:bg-[#00606E]/20 animate-fade-in">
@@ -862,6 +1420,56 @@ export default function SettingsView({ userProfile, onProfileUpdated }: Settings
             </div>
           </div>
 
+        </div>
+
+        {/* Section 5: Account Security & Privacy */}
+        <div className="bg-white border border-[#E5E2D9] rounded-3xl p-6 md:p-8 space-y-6 shadow-2xs">
+          <div className="flex items-center gap-2 pb-4 border-b border-[#E5E2D9]">
+            <Lock className="h-5 w-5 text-[#00606E]" />
+            <h3 className="text-base font-serif font-semibold text-[#1A2B32]">Account Security & Privacy</h3>
+          </div>
+
+          <p className="text-xs text-[#8A958E] leading-relaxed font-serif italic">
+            Manage your credentials, secure your access password, or trigger a fails-secure cascade purge of your entire Rumi profile and Firebase Auth account.
+          </p>
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 pt-2">
+            <button
+              type="button"
+              id="btn-go-to-change-password"
+              onClick={() => {
+                setSubView("password");
+                setSecurityStatus({ type: "idle", message: "" });
+              }}
+              className="flex items-center justify-between p-4 bg-[#F8F7F2]/60 hover:bg-[#F8F7F2] border border-[#E5E2D9] hover:border-[#00606E] rounded-2xl transition-all text-left cursor-pointer group"
+            >
+              <div className="space-y-1">
+                <span className="font-sans font-bold text-xs text-[#1A2B32] block flex items-center gap-1.5">
+                  <KeyRound className="h-3.5 w-3.5 text-[#00606E]" /> Change Password
+                </span>
+                <span className="text-[10px] text-[#8A958E] block">Update account access password with strict length and character rules</span>
+              </div>
+              <ArrowRight className="h-4 w-4 text-[#8A958E] group-hover:text-[#00606E] transition-transform group-hover:translate-x-1" />
+            </button>
+
+            <button
+              type="button"
+              id="btn-go-to-delete-account"
+              onClick={() => {
+                setSubView("delete");
+                setSecurityStatus({ type: "idle", message: "" });
+              }}
+              className="flex items-center justify-between p-4 bg-red-50/20 hover:bg-red-50/50 border border-red-100 hover:border-red-300 rounded-2xl transition-all text-left cursor-pointer group"
+            >
+              <div className="space-y-1">
+                <span className="font-sans font-bold text-xs text-red-700 block flex items-center gap-1.5">
+                  <Trash2 className="h-3.5 w-3.5 text-red-600" /> Delete Account
+                </span>
+                <span className="text-[10px] text-red-600/70 block">Cascade purge of saved tasks, schedules, and active identity</span>
+              </div>
+              <ArrowRight className="h-4 w-4 text-red-400 group-hover:text-red-600 transition-transform group-hover:translate-x-1" />
+            </button>
+          </div>
         </div>
 
         {/* Global Save Button Section */}

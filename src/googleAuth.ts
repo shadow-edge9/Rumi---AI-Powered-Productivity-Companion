@@ -449,25 +449,47 @@ export async function scanAndImportGmail(userId: string, currentRumiTasks: Task[
 
     if (discoveredTasks.length === 0) return 0;
 
-    const batch = writeBatch(db);
-    let importCount = 0;
-    let interceptedCount = 0;
-
     // Tracker map for already imported Gmail messages
     const rumiGmailMsgIds = new Set<string>();
     currentRumiTasks.forEach(t => {
       if (t.gmailMessageId) rumiGmailMsgIds.add(t.gmailMessageId);
     });
 
-    for (const dt of discoveredTasks) {
-      if (rumiGmailMsgIds.has(dt.messageId)) continue; // Skip already imported
+    // 1. DATA PRE-FILTERING: Drop legacy, blank-subject, or automated "Untitled Gmail Tasks" BEFORE database layer
+    const filteredTasks = discoveredTasks.filter((dt: any) => {
+      if (rumiGmailMsgIds.has(dt.messageId)) return false; // Skip already imported
 
-      // Check if extracted email contains empty or missing title field
       const trimmedSubject = (dt.subject || "").trim();
-      if (!trimmedSubject || trimmedSubject.toLowerCase() === "untitled" || trimmedSubject.toLowerCase() === "untitled gmail task") {
-        interceptedCount++;
-        continue;
-      }
+      const lowerSubject = trimmedSubject.toLowerCase();
+
+      const isInvalid = !trimmedSubject ||
+        lowerSubject === "untitled" ||
+        lowerSubject === "no subject" ||
+        lowerSubject === "test" ||
+        lowerSubject === "notification" ||
+        lowerSubject === "reminder" ||
+        lowerSubject === "re: reminder" ||
+        lowerSubject.includes("untitled gmail task") ||
+        lowerSubject.startsWith("untitled") ||
+        lowerSubject.includes("re: reminder") ||
+        lowerSubject.includes("automated") ||
+        lowerSubject.includes("legacy") ||
+        lowerSubject.includes("test task");
+
+      return !isInvalid;
+    });
+
+    let interceptedCount = discoveredTasks.length - filteredTasks.length;
+
+    // 2. SURGE LIMITER: If a sync event pulls more than 50 tasks at once, batch and limit to prevent quota exhaustion
+    const isSurgeDetected = filteredTasks.length > 50;
+    const tasksToProcess = filteredTasks.slice(0, 50);
+
+    const batch = writeBatch(db);
+    let importCount = 0;
+
+    for (const dt of tasksToProcess) {
+      const trimmedSubject = (dt.subject || "").trim();
 
       // Check if task with same title and due date already exists to avoid duplicates
       const isDuplicate = currentRumiTasks.some(existing => 
@@ -499,16 +521,24 @@ export async function scanAndImportGmail(userId: string, currentRumiTasks: Task[
       importCount++;
     }
 
-    if (interceptedCount > 0) {
+    // Write a notification if surge was intercepted, or if untitled tasks were dropped
+    if (interceptedCount > 0 || isSurgeDetected) {
       try {
+        let notificationMsg = "";
+        if (isSurgeDetected) {
+          notificationMsg = `Rumi detected a sync surge (${filteredTasks.length} tasks). Capped import to 50 tasks to protect your system quota and maintain a mindful workspace.`;
+        } else {
+          notificationMsg = `Rumi completed Gmail sync and safely dropped ${interceptedCount} automated/blank-subject legacy tasks before import.`;
+        }
+
         await addDoc(collection(db, "users", userId, "notifications"), {
           userId,
-          message: `Rumi found ${interceptedCount} Untitled Gmail Task${interceptedCount > 1 ? "s" : ""} in your Gmail. Check them out when you have time.`,
+          message: notificationMsg,
           read: false,
           createdAt: new Date().toISOString()
         });
       } catch (nErr) {
-        console.error("Failed to write interception notification:", nErr);
+        console.error("Failed to write interception/surge notification:", nErr);
       }
     }
 

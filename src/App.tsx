@@ -26,7 +26,11 @@ import {
   Flame,
   Calendar as CalendarIcon,
   Settings,
-  Bell
+  Bell,
+  WifiOff,
+  Wifi,
+  AlertCircle,
+  Coffee
 } from "lucide-react";
 import Onboarding from "./components/Onboarding";
 import Dashboard from "./components/Dashboard";
@@ -46,6 +50,40 @@ export default function App() {
   const [isChatOpen, setIsChatOpen] = useState(false);
   const [triggerMoodyGreeting, setTriggerMoodyGreeting] = useState(false);
   const [notifications, setNotifications] = useState<AppNotification[]>([]);
+
+  // Network and Quota status states
+  const [isOffline, setIsOffline] = useState(typeof navigator !== "undefined" ? !navigator.onLine : false);
+  const [isReconnecting, setIsReconnecting] = useState(false);
+  const [wasOfflineButBack, setWasOfflineButBack] = useState(false);
+  const [isQuotaExceeded, setIsQuotaExceeded] = useState(false);
+
+  // Network status listeners
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+
+    const handleOnline = () => {
+      setIsOffline(false);
+      setIsReconnecting(true);
+      setTimeout(() => {
+        setIsReconnecting(false);
+        setWasOfflineButBack(true);
+        setTimeout(() => setWasOfflineButBack(false), 4000);
+      }, 1800);
+    };
+
+    const handleOffline = () => {
+      setIsOffline(true);
+      setWasOfflineButBack(false);
+    };
+
+    window.addEventListener("online", handleOnline);
+    window.addEventListener("offline", handleOffline);
+
+    return () => {
+      window.removeEventListener("online", handleOnline);
+      window.removeEventListener("offline", handleOffline);
+    };
+  }, []);
 
   // Authentication states
   const [isSignUp, setIsSignUp] = useState(false);
@@ -88,36 +126,29 @@ export default function App() {
     const q = query(collection(db, "users", user.uid, "tasks"));
     const unsubscribe = onSnapshot(q, (snapshot) => {
       const fetchedTasks: Task[] = [];
-      const batch = writeBatch(db);
-      let foundUntitledCount = 0;
 
       snapshot.forEach((docRef) => {
         const taskData = docRef.data() as Task;
         const trimmedTitle = (taskData.title || "").trim();
-        if (
+        const lowerTitle = trimmedTitle.toLowerCase();
+        
+        // Soft filter out legacy/blank-subject or automated untitled/ghost tasks on the client-side
+        const isGhostTask = 
           !trimmedTitle ||
-          trimmedTitle.toLowerCase() === "untitled" ||
-          trimmedTitle.toLowerCase() === "untitled gmail task" ||
-          trimmedTitle.toLowerCase() === "untitled gmail task event" ||
-          trimmedTitle.startsWith("Untitled Gmail Task")
-        ) {
-          batch.delete(doc(db, "users", user.uid, "tasks", docRef.id));
-          foundUntitledCount++;
-        } else {
+          lowerTitle === "untitled" ||
+          lowerTitle === "untitled gmail task" ||
+          lowerTitle === "untitled gmail task event" ||
+          lowerTitle.startsWith("untitled") ||
+          lowerTitle === "re: reminder" ||
+          lowerTitle === "reminder" ||
+          lowerTitle.includes("re: reminder") ||
+          lowerTitle === "test" ||
+          lowerTitle === "notification";
+
+        if (!isGhostTask) {
           fetchedTasks.push({ id: docRef.id, ...taskData });
         }
       });
-
-      if (foundUntitledCount > 0) {
-        const notificationRef = doc(collection(db, "users", user.uid, "notifications"));
-        batch.set(notificationRef, {
-          userId: user.uid,
-          message: `Rumi found ${foundUntitledCount} Untitled Gmail Task${foundUntitledCount > 1 ? "s" : ""} in your Gmail. Check them out when you have time.`,
-          read: false,
-          createdAt: new Date().toISOString()
-        });
-        batch.commit().catch((err) => console.error("Error cleaning up and notifying ghost tasks:", err));
-      }
 
       // Sort: incomplete first, then sort by due date ascending
       fetchedTasks.sort((a, b) => {
@@ -127,8 +158,11 @@ export default function App() {
         return a.dueDate.localeCompare(b.dueDate);
       });
       setTasks(fetchedTasks);
-    }, (error) => {
+    }, (error: any) => {
       console.error("Error subscribing to tasks:", error);
+      if (error?.code === "resource-exhausted" || error?.message?.toLowerCase().includes("quota")) {
+        setIsQuotaExceeded(true);
+      }
     });
 
     return () => unsubscribe();
@@ -145,8 +179,11 @@ export default function App() {
         fetchedNotifications.push({ id: doc.id, ...doc.data() } as AppNotification);
       });
       setNotifications(fetchedNotifications);
-    }, (error) => {
+    }, (error: any) => {
       console.error("Error subscribing to notifications:", error);
+      if (error?.code === "resource-exhausted" || error?.message?.toLowerCase().includes("quota")) {
+        setIsQuotaExceeded(true);
+      }
     });
 
     return () => unsubscribe();
@@ -161,8 +198,11 @@ export default function App() {
         batch.delete(doc(db, "users", user.uid, "notifications", n.id));
       });
       await batch.commit();
-    } catch (error) {
+    } catch (error: any) {
       console.error("Error clearing all notifications:", error);
+      if (error?.code === "resource-exhausted" || error?.message?.toLowerCase().includes("quota")) {
+        setIsQuotaExceeded(true);
+      }
     }
   };
 
@@ -170,8 +210,11 @@ export default function App() {
     if (!user) return;
     try {
       await deleteDoc(doc(db, "users", user.uid, "notifications", id));
-    } catch (error) {
+    } catch (error: any) {
       console.error("Error deleting notification:", error);
+      if (error?.code === "resource-exhausted" || error?.message?.toLowerCase().includes("quota")) {
+        setIsQuotaExceeded(true);
+      }
     }
   };
 
@@ -185,8 +228,11 @@ export default function App() {
         }
       });
       await batch.commit();
-    } catch (error) {
+    } catch (error: any) {
       console.error("Error marking notifications as read:", error);
+      if (error?.code === "resource-exhausted" || error?.message?.toLowerCase().includes("quota")) {
+        setIsQuotaExceeded(true);
+      }
     }
   };
 
@@ -198,18 +244,26 @@ export default function App() {
       const shiftDays = userProfile.shiftToHighPriorityDays !== undefined ? userProfile.shiftToHighPriorityDays : 3;
       const thresholdTime = Date.now() - (shiftDays * 24 * 60 * 60 * 1000);
 
+      const batch = writeBatch(db);
+      let hasUpdates = false;
+
       for (const task of tasks) {
         if (!task.completed && task.priority !== "High-Priority" && task.createdAt) {
           const createdAtTime = new Date(task.createdAt).getTime();
           if (createdAtTime < thresholdTime) {
-            try {
-              const taskRef = doc(db, "users", user.uid, "tasks", task.id);
-              await updateDoc(taskRef, { priority: "High-Priority" });
-              console.log(`Passive Escalation: Escalated task "${task.title}" to High Priority (created ${shiftDays}+ days ago)`);
-            } catch (err) {
-              console.error("Error performing passive task escalation:", err);
-            }
+            const taskRef = doc(db, "users", user.uid, "tasks", task.id);
+            batch.update(taskRef, { priority: "High-Priority" });
+            hasUpdates = true;
           }
+        }
+      }
+
+      if (hasUpdates) {
+        try {
+          await batch.commit();
+          console.log("Passive Escalation: Committed batch task updates to High Priority");
+        } catch (err) {
+          console.error("Error performing passive task escalation batch commit:", err);
         }
       }
     };
@@ -343,9 +397,10 @@ export default function App() {
       );
 
       const userRef = doc(db, "users", user.uid);
+      const batch = writeBatch(db);
 
       if (filteredNewEntries.length > 0) {
-        await updateDoc(userRef, {
+        batch.update(userRef, {
           completedTasksHistory: [...existingHistory, ...filteredNewEntries]
         });
       }
@@ -353,8 +408,10 @@ export default function App() {
       // Delete the tasks from Firestore
       for (const t of tasksToCleanup) {
         const taskRef = doc(db, "users", user.uid, "tasks", t.id);
-        await deleteDoc(taskRef);
+        batch.delete(taskRef);
       }
+
+      await batch.commit();
 
       // Refresh the user profile to get updated completedTasksHistory
       fetchUserProfile(user.uid);
@@ -784,7 +841,77 @@ export default function App() {
       </aside>
 
       {/* Main Content Area */}
-      <main id="main-content" className="flex-1 p-6 md:p-10 lg:p-12 max-w-5xl mx-auto w-full">
+      <main id="main-content" className="flex-1 p-6 md:p-10 lg:p-12 max-w-5xl mx-auto w-full space-y-6">
+        
+        {/* Network & Connectivity fluidity Banner States */}
+        {isOffline && (
+          <div id="connectivity-offline-banner" className="bg-[#FEF2F2] border border-[#FECACA] rounded-2xl p-4 flex items-center justify-between shadow-xs animate-fade-in">
+            <div className="flex items-center gap-3">
+              <div className="bg-[#FEE2E2] p-2.5 rounded-xl text-[#EF4444]">
+                <WifiOff className="h-5 w-5 animate-pulse" />
+              </div>
+              <div>
+                <h4 className="text-xs font-bold text-[#991B1B]">Offline Mode Enabled</h4>
+                <p className="text-[11px] text-[#7F1D1D] mt-0.5">Your connection is paused. Please keep planning and chatting; Rumi will seamlessly sync your workspace when you're back online.</p>
+              </div>
+            </div>
+            <span className="text-[9px] font-bold text-[#EF4444] bg-[#FEE2E2] px-2 py-1 rounded-full uppercase tracking-wider shrink-0">Working Local</span>
+          </div>
+        )}
+
+        {isReconnecting && (
+          <div id="connectivity-reconnecting-banner" className="bg-[#FFFBEB] border border-[#FDE68A] rounded-2xl p-4 flex items-center justify-between shadow-xs animate-fade-in">
+            <div className="flex items-center gap-3">
+              <div className="bg-[#FEF3C7] p-2.5 rounded-xl text-[#D97706]">
+                <Loader2 className="h-5 w-5 animate-spin" />
+              </div>
+              <div>
+                <h4 className="text-xs font-bold text-[#92400E]">Reconnecting</h4>
+                <p className="text-[11px] text-[#78350F] mt-0.5">Aligning your workspace with our cloud database...</p>
+              </div>
+            </div>
+            <span className="text-[9px] font-bold text-[#D97706] bg-[#FEF3C7] px-2 py-1 rounded-full uppercase tracking-wider shrink-0">Syncing</span>
+          </div>
+        )}
+
+        {wasOfflineButBack && (
+          <div id="connectivity-online-banner" className="bg-[#ECFDF5] border border-[#A7F3D0] rounded-2xl p-4 flex items-center justify-between shadow-xs animate-fade-in">
+            <div className="flex items-center gap-3">
+              <div className="bg-[#D1FAE5] p-2.5 rounded-xl text-[#10B981]">
+                <Wifi className="h-5 w-5" />
+              </div>
+              <div>
+                <h4 className="text-xs font-bold text-[#065F46]">Back Online</h4>
+                <p className="text-[11px] text-[#047857] mt-0.5">Sync successful! All task states are safely aligned with the cloud database.</p>
+              </div>
+            </div>
+            <span className="text-[9px] font-bold text-[#10B981] bg-[#D1FAE5] px-2 py-1 rounded-full uppercase tracking-wider shrink-0">Connected</span>
+          </div>
+        )}
+
+        {/* Firebase Quota Rest (Mindful Rest for Rumi) Banner */}
+        {isQuotaExceeded && (
+          <div id="quota-exceeded-banner" className="bg-[#F0FDFA] border border-[#CCFBF1] rounded-2xl p-5 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 shadow-sm animate-fade-in">
+            <div className="flex items-start gap-4">
+              <div className="bg-[#E6FDF9] p-3 rounded-2xl text-[#00606E] shrink-0 border border-[#99F6E4]/40">
+                <Coffee className="h-6 w-6 animate-bounce" />
+              </div>
+              <div>
+                <h4 className="text-sm font-serif font-bold text-[#115E59]">Rumi is Taking a Mindful Rest</h4>
+                <p className="text-[11.5px] text-[#134E4A] mt-1 leading-relaxed font-sans max-w-2xl">
+                  To ensure your workspace remains a calm, serene environment, our database sync is pausing temporarily due to system quota limits. <strong>Don't worry—your existing tasks and progress are completely safe and preserved!</strong> Normal synchronization will resume automatically. Feel free to keep focusing on your goals in the meantime.
+                </p>
+              </div>
+            </div>
+            <button 
+              onClick={() => setIsQuotaExceeded(false)}
+              className="text-[11px] text-[#00606E] font-bold hover:underline bg-[#E6FDF9] px-3.5 py-1.5 rounded-xl border border-[#99F6E4]/40 shrink-0 self-end sm:self-center"
+            >
+              Acknowledge
+            </button>
+          </div>
+        )}
+
         {activeTab === "dashboard" && (
           <Dashboard
             userProfile={userProfile}

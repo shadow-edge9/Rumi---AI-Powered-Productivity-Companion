@@ -80,6 +80,19 @@
         "messages": { "type": "array" }
       },
       "required": ["title", "createdAt", "messages"]
+    },
+    "Notification": {
+      "title": "Notification",
+      "description": "App notification or alert message.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "userId": { "type": "string" },
+        "message": { "type": "string" },
+        "read": { "type": "boolean" },
+        "createdAt": { "type": "string" }
+      },
+      "required": ["userId", "message", "read", "createdAt"]
     }
   },
   "firestore": {
@@ -102,6 +115,10 @@
     "/users/{userId}/saved_chats/{savedChatId}": {
       "schema": "SavedChat",
       "description": "Stores user's saved Rumi conversations."
+    },
+    "/users/{userId}/notifications/{notificationId}": {
+      "schema": "Notification",
+      "description": "Stores user's in-app notifications."
     }
   }
 }

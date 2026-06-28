@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from "react";
 import { Task, TaskType, TaskCategory, TaskPriority, UserProfile } from "../types";
 import { CheckSquare, Square, Calendar, Plus, Filter, ShieldAlert, Sparkles, Smile, RefreshCcw, Bell, ChevronDown, ChevronUp, Paperclip, Sun, CloudSun, Moon, Cloud, Star, Clock, X } from "lucide-react";
-import { collection, addDoc, doc, updateDoc, deleteDoc, setDoc } from "firebase/firestore";
+import { collection, addDoc, doc, updateDoc, deleteDoc, setDoc, writeBatch } from "firebase/firestore";
 import { db } from "../firebase";
 import { motion } from "motion/react";
 import MissedDeadlineDialog from "./MissedDeadlineDialog";
@@ -145,6 +145,15 @@ export default function Dashboard({
   };
 
   // Expand task card state
+  const [toast, setToast] = useState<{ message: string; type: "success" | "error" | "info" } | null>(null);
+
+  const showToast = (message: string, type: "success" | "error" | "info" = "success") => {
+    setToast({ message, type });
+    setTimeout(() => {
+      setToast(null);
+    }, 4000);
+  };
+
   const [expandedTaskId, setExpandedTaskId] = useState<string | null>(null);
 
   // Add Task Form State
@@ -194,6 +203,7 @@ export default function Dashboard({
       onTaskUpdated(); // Refresh dashboard list
     } catch (err) {
       console.error("Error editing task:", err);
+      showToast("An update error occurred. Please try again.", "error");
     } finally {
       setSavingTask(false);
     }
@@ -336,7 +346,7 @@ export default function Dashboard({
 
       return () => clearInterval(interval);
     }
-  }, [userProfile, tasks.length]);
+  }, [userProfile?.uid]);
 
   // Scan deadlines and trigger high priority adjustments proactively on mount/load
   useEffect(() => {
@@ -347,6 +357,9 @@ export default function Dashboard({
     let count = 0;
 
     const scanAndProactivelyPrioritize = async () => {
+      const batch = writeBatch(db);
+      let hasUpdates = false;
+
       for (const task of tasks) {
         if (task.completed) continue;
 
@@ -359,16 +372,23 @@ export default function Dashboard({
         // If task is within 3 days (inclusive) and not currently High-Priority, automatically upgrade!
         if (diffDays <= 3 && diffDays >= 0 && task.priority !== "High-Priority") {
           const taskRef = doc(db, "users", userProfile.uid, "tasks", task.id);
-          await updateDoc(taskRef, {
+          batch.update(taskRef, {
             priority: "High-Priority"
           });
           count++;
+          hasUpdates = true;
         }
       }
 
-      if (count > 0) {
-        setUpgradedCount(count);
-        onTaskUpdated();
+      if (hasUpdates) {
+        try {
+          await batch.commit();
+          setUpgradedCount(count);
+          onTaskUpdated();
+          console.log(`Proactive Prioritization: Prioritized ${count} tasks to High-Priority in a single batch.`);
+        } catch (err) {
+          console.error("Error committing proactive prioritization batch:", err);
+        }
       }
     };
 
@@ -481,6 +501,7 @@ export default function Dashboard({
       onTaskUpdated();
     } catch (error) {
       console.error("Error completing task:", error);
+      showToast("An update error occurred. Please try again.", "error");
     }
   };
 
@@ -497,6 +518,7 @@ export default function Dashboard({
       onTaskUpdated();
     } catch (error) {
       console.error("Error rescheduling task:", error);
+      showToast("An update error occurred. Please try again.", "error");
     }
   };
 
@@ -512,6 +534,7 @@ export default function Dashboard({
       onTaskUpdated();
     } catch (error) {
       console.error("Error dismissing task:", error);
+      showToast("An update error occurred. Please try again.", "error");
     }
   };
 
@@ -546,6 +569,7 @@ export default function Dashboard({
       onTaskUpdated();
     } catch (error) {
       console.error("Error adding task:", error);
+      showToast("An update error occurred. Please try again.", "error");
     } finally {
       setSavingTask(false);
     }
@@ -1445,6 +1469,16 @@ export default function Dashboard({
         }}
         onReschedule={handlePeacefulReschedule}
       />
+
+      {toast && (
+        <div className={`fixed bottom-4 right-4 z-50 flex items-center gap-2 px-4 py-3 rounded-2xl shadow-lg border text-xs font-medium animate-bounce ${
+          toast.type === "error" ? "bg-red-50 border-red-200 text-red-800" :
+          toast.type === "success" ? "bg-[#F4F9F9] border-[#00606E]/20 text-[#00606E]" :
+          "bg-gray-50 border-gray-200 text-gray-800"
+        }`}>
+          <span>{toast.message}</span>
+        </div>
+      )}
     </div>
   );
 }

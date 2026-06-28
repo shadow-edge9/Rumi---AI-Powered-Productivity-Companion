@@ -47,7 +47,7 @@ service cloud.firestore {
       allow read: if isOwner(userId);
       allow create: if isOwner(userId) && isValidUser(request.resource.data);
       allow update: if isOwner(userId) && isValidUser(request.resource.data);
-      allow delete: if false;
+      allow delete: if isOwner(userId);
 
       match /tasks/{taskId} {
         allow read: if isOwner(userId);
@@ -75,6 +75,13 @@ service cloud.firestore {
         allow create: if isOwner(userId) && isValidId(savedChatId);
         allow update: if false;
         allow delete: if isOwner(userId) && isValidId(savedChatId);
+      }
+
+      match /notifications/{notificationId} {
+        allow read: if isOwner(userId);
+        allow create: if isOwner(userId) && isValidId(notificationId);
+        allow update: if isOwner(userId) && isValidId(notificationId);
+        allow delete: if isOwner(userId) && isValidId(notificationId);
       }
     }
   }
