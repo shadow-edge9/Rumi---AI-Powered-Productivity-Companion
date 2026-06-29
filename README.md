@@ -8,6 +8,9 @@ This contains everything you need to run your app locally.
 
 View your app in AI Studio: https://ai.studio/apps/4e490fd1-618e-4f57-8812-731cdd4a517e
 
+# Vibe2Ship (Coding Ninjas x Google for Developers) 2026
+This Project is a submission for the Vibe2Ship Hackathon 2026
+
 ## Problem Statement: The Last-Minute Life Saver
 Students, professionals, and entrepreneurs frequently miss deadlines, assignments, meetings, bill payments, interviews, and important commitments. Existing productivity tools often rely on passive reminders that are easy to ignore and do little to help users actually complete their tasks.
 
