@@ -79,3 +79,13 @@ micro-task schedule with custom timeline recommendations.
 2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
 3. Run the app:
    `npm run dev`
+
+## DEMO VIDEO
+
+https://github.com/user-attachments/assets/e70d3df7-f551-4e7b-acf4-2781b243f27f
+
+
+
+
+
+
